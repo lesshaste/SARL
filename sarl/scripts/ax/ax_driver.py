@@ -35,17 +35,17 @@ HYDRA_CONFIG_PATH = "../../config"
 # - computation:
 CPU_CORES_PER_TASK = 4
 # ---[Toy settings]---
-MAX_TRIALS = 2 # Big effect on duration
+MAX_TRIALS = 40 # Big effect on duration
 PARALLEL_LIMIT = 2
-TRAIN_EPISODES = 2
-LEARNING_STEPS = 10 # per episode  # Multiple of on_policy_params.n_steps
-CYCLES = 2
+# TRAIN_EPISODES = 2
+# LEARNING_STEPS = 10 # per episode  # Multiple of on_policy_params.n_steps
+# CYCLES = 2
 # ---[Proper settings]---
 # MAX_TRIALS = 40  # Big effect on duration
 # PARALLEL_LIMIT = 40
-# TRAIN_EPISODES = 1000000
-# LEARNING_STEPS = 400000  # Multiple of on_policy_params.n_steps
-# CYCLES = 128
+TRAIN_EPISODES = 1000000
+LEARNING_STEPS = 400000  # Multiple of on_policy_params.n_steps
+CYCLES = 128
 # ---[on-policy algs]---
 ON_POLICY_PARAMS = {"n_steps": 100}
 # ---[common bounds]---

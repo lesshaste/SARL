@@ -143,19 +143,27 @@ class HybridPolicy:
         Alternate training between discrete and continuous agents.
 
         total_timesteps is in *converted MDP* timesteps (i.e., partial steps).
+
+        This version uses Option A budget allocation:
+          - Allocate a fixed per-cycle budget: per_cycle = total_timesteps / cycles
+          - Split per_cycle between discrete/continuous according to update_ratio
+          - Ensures discrete_steps + continuous_steps == per_cycle (so total adds up cleanly)
         """
-        assert cycles >= 1
+        if cycles < 1:
+            raise ValueError("cycles must be >= 1")
+
+        # Keep strict divisibility to make accounting clean/predictable
         if total_timesteps % cycles != 0:
             raise ValueError(f"total_timesteps ({total_timesteps}) must be divisible by cycles ({cycles})")
 
-        # per cycle, split timesteps between discrete/continuous
-        timesteps_per_agent = int(total_timesteps / cycles / 2)
+        # Clamp ratio to [0, 1]
+        update_ratio = float(update_ratio)
+        if update_ratio < 0.0:
+            update_ratio = 0.0
+        if update_ratio > 1.0:
+            update_ratio = 1.0
 
-        # Align to rollout length if requested (e.g. PPO n_steps)
-        if rollout_length:
-            timesteps_per_agent = (timesteps_per_agent // rollout_length) * rollout_length
-
-        # attach bookkeeping used by DataCallback
+        # Attach bookkeeping used by DataCallback and elsewhere
         self.timestep = 0
         for agent_type in self.agent.keys():
             agent = self.agent[agent_type]
@@ -166,18 +174,34 @@ class HybridPolicy:
 
         evaluation_returns = []
 
+        # Fixed per-cycle budget
+        per_cycle = int(total_timesteps // cycles)
+
+        # If requested, align per-cycle budget to rollout length (e.g. PPO n_steps) to avoid 0 updates.
+        # This will reduce total trained timesteps slightly unless you also pre-align total_timesteps.
+        if rollout_length:
+            rollout_length = int(rollout_length)
+            if rollout_length > 0:
+                per_cycle = (per_cycle // rollout_length) * rollout_length
+            else:
+                rollout_length = None
+
+        if per_cycle <= 0:
+            raise ValueError(
+                f"per_cycle budget became {per_cycle}. Increase total_timesteps or reduce cycles/rollout_length."
+            )
+
         for cycle in range(cycles):
             self.cycle = cycle
 
-            for agent_type in ["discrete", "continuous"]:
-                agent = self.agent[agent_type]
+            # Split per-cycle budget across agents
+            discrete_steps = int(update_ratio * per_cycle)
+            continuous_steps = int(per_cycle - discrete_steps)  # ensures sum == per_cycle
+
+            for agent_type, ratioed_timesteps in (("discrete", discrete_steps), ("continuous", continuous_steps)):
+                agent = self.agent.get(agent_type)
                 if agent is None:
                     continue
-
-                if agent_type == "discrete":
-                    ratioed_timesteps = int(update_ratio * timesteps_per_agent)
-                else:
-                    ratioed_timesteps = int((1.0 - update_ratio) * timesteps_per_agent)
 
                 if ratioed_timesteps <= 0:
                     print(
@@ -212,9 +236,12 @@ class HybridPolicy:
                     progress_bar=progress_bar,
                 )
 
-            # evaluate at end of cycle
+                # Advance bookkeeping counter so logs/eval reflect actual trained timesteps
+                self.timestep += int(ratioed_timesteps)
+
+            # Evaluate at end of cycle
             if evaluation_interval is not None and eval_mdp is not None:
-                if (cycle + 1) % evaluation_interval == 0:
+                if (cycle + 1) % int(evaluation_interval) == 0:
                     evaluation_returns = self._evaluate(
                         eval_mdp, evaluation_returns, cycle, eval_episodes, log_dir
                     )
@@ -222,7 +249,6 @@ class HybridPolicy:
         if len(evaluation_returns) == 0:
             return 0.0
         return float(np.mean([ret[1] for ret in evaluation_returns]))
-
 
 # --------------------------------------------------------------------------------------
 # View wrappers: expose only discrete OR only continuous actions while an internal policy
