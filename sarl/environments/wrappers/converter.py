@@ -1,4 +1,6 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, Callable, Optional
 
 import numpy as np
 from gymnasium import Env, Wrapper, spaces
@@ -6,19 +8,35 @@ from gymnasium.core import ObsType
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.callbacks import CallbackList
 
-from sarl.agents.callbacks.data_callback import DataCallback
 
+# --------------------------------------------------------------------------------------
+# Hybrid policy: coordinates a discrete-policy and a continuous-parameters policy
+# on the converted MDP (PamdpToMdp).
+# --------------------------------------------------------------------------------------
 
 class HybridPolicy:
-    # For combining two separate policies for use with the converter
-    # TODO: Consider inheriting from SB3 equivalent base class
-    def __init__(self, discretePolicy=None, continuousPolicy=None,
-        discreteAgent=None, continuousAgent=None, name=None, env_name=None,
-        seed=None) -> None:
+    """
+    Combines two policies (or SB3 agents) to act on the converted MDP.
+
+    Convention:
+      - If obs[0] == -1 => environment is expecting the DISCRETE action id
+      - else            => environment is expecting the CONTINUOUS parameters
+    """
+
+    def __init__(
+        self,
+        discretePolicy: Optional[Callable[[Any], Any]] = None,
+        continuousPolicy: Optional[Callable[[Any], Any]] = None,
+        discreteAgent: Optional[BaseAlgorithm] = None,
+        continuousAgent: Optional[BaseAlgorithm] = None,
+        name: Optional[str] = None,
+        env_name: Optional[str] = None,
+        seed: Optional[int] = None,
+    ) -> None:
         self.agent = {key: None for key in ["discrete", "continuous"]}
         self.name = name
-        self.timestep = None
-        self.cycle = None
+        self.timestep = 0
+        self.cycle = 0
         self.env_name = env_name
         self.seed = seed
 
@@ -27,166 +45,258 @@ class HybridPolicy:
         elif discreteAgent is not None:
             self.agent["discrete"] = discreteAgent
             self.discretePolicy = discreteAgent.predict
+        else:
+            raise ValueError("Provide either discretePolicy or discreteAgent")
 
         if continuousPolicy is not None:
             self.continuousPolicy = continuousPolicy
         elif continuousAgent is not None:
             self.agent["continuous"] = continuousAgent
             self.continuousPolicy = continuousAgent.predict
+        else:
+            raise ValueError("Provide either continuousPolicy or continuousAgent")
 
-    def _evaluate(self, eval_mdp, evaluation_returns, cycle, eval_episodes,
-        log_dir):
-        timestep = self.timestep
-        returns = []
-        for i in range(eval_episodes):
-            obs, info = eval_mdp.reset(seed=self.seed+cycle+i)
-            episode_over = False
-            while not episode_over:
-                action = self.predict(obs)
-                obs, reward, terminated, truncated, info = eval_mdp.step(action)
-                action = self.predict(obs)
-                obs, reward, terminated, truncated, info = eval_mdp.step(action)
-                episode_over = terminated or truncated
-            returns.append(info["episode"]["r"])
-        mean_return = (timestep, np.mean(returns))
-        evaluation_returns.append(mean_return)
-        file_name = f"{log_dir}/eval.csv"
-        print(f"[REWARD]: Mean reward = {mean_return[1]}")
-        print(f"[OUTPUT]: Writing to {file_name}")
-        np.savetxt(fname=file_name, X=np.array(evaluation_returns),
-            header='"training_timesteps","mean_eval_episode_return"',
-            delimiter=',', fmt="%1.3f"
-        )
-        return evaluation_returns
-
-
-    def learn(self, total_timesteps, evaluation_interval=None, eval_mdp=None,
-        cycles=1, callback=None, log_interval=1, tb_log_name='run',
-        reset_num_timesteps=False, progress_bar=False, eval_episodes=15,
-        log_dir=None, rollout_length=None, update_ratio=0.5):
-        # TODO: Handle PPO's (and other on-policy algs, like A2C) n_steps parameter to ensure no. training episodes per cycle half are as requested
-        assert cycles >= 1
-        if cycles > 1:
-            if total_timesteps % cycles != 0:
-                raise ValueError(f"total_timesteps ({total_timesteps}) must be divisible by cycles ({cycles})")
-        timesteps_per_agent = int(total_timesteps / cycles / len(self.agent.keys()))
-        if rollout_length:
-            timesteps_per_agent = timesteps_per_agent // rollout_length * rollout_length
-        # TODO: Remove line
-        # timesteps_per_cycle = timesteps_per_agent * 2
-        self.timestep = 0
-        for agent_type in self.agent.keys():
-            self.agent[agent_type].agent_type = agent_type
-            self.agent[agent_type].parent = self
-        evaluation_returns = []
-        for cycle in range(cycles-1):  # Was the '-1' necessary?
-            self.cycle = cycle
-            for agent_type in self.agent.keys():
-                ratioed_timesteps = 0
-                if agent_type == "discrete":
-                    ratioed_timesteps = int(update_ratio * timesteps_per_agent)
-                elif agent_type == "continuous":
-                    ratioed_timesteps = int((1-update_ratio) * timesteps_per_agent)
-                else:
-                    raise(NotImplementedError)
-                print(f"[{self.name}][Seed {self.agent[agent_type].seed}][Timestep {self.timestep}/{total_timesteps}][Cycle {cycle+1}/{cycles}][{agent_type}]: Learning for {timesteps_per_agent}+ timesteps...")
-                # self.timestep = self.timestep + timesteps_per_agent
-                agent = self.agent[agent_type]
-                if agent is not None:
-                    if isinstance(agent, BaseAlgorithm):
-                        tb_log_name_for_component_agents = (tb_log_name+"_"+agent_type)
-                        if callback is not None:
-                            callback = CallbackList([callback])
-                        self.agent[agent_type].learn(ratioed_timesteps,
-                            callback, log_interval,
-                            tb_log_name_for_component_agents,
-                            reset_num_timesteps, progress_bar)
-                    else:
-                        raise NotImplementedError
-            eval_bool = evaluation_interval is not None
-            if eval_bool and (cycle + 1) % evaluation_interval == 0:
-                evaluation_returns = self._evaluate(eval_mdp, evaluation_returns, cycle, eval_episodes, log_dir)
-        return np.mean([ret[1] for ret in evaluation_returns])
-
+    def _call_policy(self, policy: Callable, obs_inner):
+        """
+        Handles SB3 predict() and plain callables uniformly.
+        SB3 predict returns (action, state). Custom callables return action.
+        """
+        try:
+            out = policy(obs_inner)
+        except TypeError:
+            # If someone passes SB3 policy expecting (obs, state, episode_start, deterministic)
+            out = policy(obs_inner, deterministic=False)
+        if isinstance(out, tuple):
+            return out[0]
+        return out
 
     def predict(self, obs):
-        if obs[0]==-1:
-            policy = self.discretePolicy
-        else:
-            assert obs[0] > -1
-            policy = self.continuousPolicy
-        if policy.__qualname__ == "BaseAlgorithm.predict":  # If the policy is the method of a StableBaselines3 BaseAlgorithm object
-            prediction = policy(obs[1])[0]  # Since prediction[1] is irrelevant unused hidden state information
-            if obs[0]==-1:
-                prediction = int(prediction)
-        elif policy.__qualname__ == "DQN.predict":
-            prediction = policy(obs[1])[0]  # DQN's predict returns a tuple of (action, state)
-        else:
-            prediction = policy(obs[1])
-        return prediction
+        # obs is (indicator, original_obs)
+        if obs[0] == -1:
+            action = self._call_policy(self.discretePolicy, obs[1])
+            # SB3 often returns np.array([...]) for discrete
+            if isinstance(action, (np.ndarray, list)):
+                action = int(np.asarray(action).squeeze())
+            else:
+                action = int(action)
+            return action
 
+        # continuous parameters
+        assert obs[0] > -1
+        action = self._call_policy(self.continuousPolicy, obs[1])
+        return action
+
+    def _evaluate(self, eval_mdp, evaluation_returns, cycle, eval_episodes, log_dir):
+        returns = []
+        base_seed = 0 if self.seed is None else int(self.seed)
+        for i in range(eval_episodes):
+            obs, info = eval_mdp.reset(seed=base_seed + cycle + i)
+            done = False
+            last_info = info
+            while not done:
+                action = self.predict(obs)
+                obs, reward, terminated, truncated, last_info = eval_mdp.step(action)
+                done = bool(terminated or truncated)
+            # RecordEpisodeStatistics puts episode return in info["episode"]["r"] on terminal step
+            ep_ret = last_info.get("episode", {}).get("r", None)
+            if ep_ret is None:
+                # Fallback: if wrapper not present, accumulate would be needed. Here just use 0.
+                ep_ret = 0.0
+            returns.append(float(ep_ret))
+
+        mean_return = (float(self.timestep), float(np.mean(returns)))
+        evaluation_returns.append(mean_return)
+
+        if log_dir is not None:
+            file_name = f"{log_dir}/eval.csv"
+            print(f"[REWARD]: Mean reward = {mean_return[1]}")
+            print(f"[OUTPUT]: Writing to {file_name}")
+            np.savetxt(
+                fname=file_name,
+                X=np.array(evaluation_returns, dtype=np.float64),
+                header='"training_timesteps","mean_eval_episode_return"',
+                delimiter=",",
+                fmt="%1.6f",
+            )
+        else:
+            print(f"[REWARD]: Mean reward = {mean_return[1]}")
+
+        return evaluation_returns
+
+    def learn(
+        self,
+        total_timesteps: int,
+        evaluation_interval: Optional[int] = None,
+        eval_mdp=None,
+        cycles: int = 1,
+        callback=None,
+        log_interval: int = 1,
+        tb_log_name: str = "run",
+        reset_num_timesteps: bool = False,
+        progress_bar: bool = False,
+        eval_episodes: int = 15,
+        log_dir: Optional[str] = None,
+        rollout_length: Optional[int] = None,
+        update_ratio: float = 0.5,
+    ):
+        """
+        Alternate training between discrete and continuous agents.
+
+        total_timesteps is in *converted MDP* timesteps (i.e., partial steps).
+        """
+        assert cycles >= 1
+        if total_timesteps % cycles != 0:
+            raise ValueError(f"total_timesteps ({total_timesteps}) must be divisible by cycles ({cycles})")
+
+        # per cycle, split timesteps between discrete/continuous
+        timesteps_per_agent = int(total_timesteps / cycles / 2)
+
+        # Align to rollout length if requested (e.g. PPO n_steps)
+        if rollout_length:
+            timesteps_per_agent = (timesteps_per_agent // rollout_length) * rollout_length
+
+        # attach bookkeeping used by DataCallback
+        self.timestep = 0
+        for agent_type in self.agent.keys():
+            agent = self.agent[agent_type]
+            if agent is None:
+                continue
+            agent.agent_type = agent_type
+            agent.parent = self
+
+        evaluation_returns = []
+
+        for cycle in range(cycles):
+            self.cycle = cycle
+
+            for agent_type in ["discrete", "continuous"]:
+                agent = self.agent[agent_type]
+                if agent is None:
+                    continue
+
+                if agent_type == "discrete":
+                    ratioed_timesteps = int(update_ratio * timesteps_per_agent)
+                else:
+                    ratioed_timesteps = int((1.0 - update_ratio) * timesteps_per_agent)
+
+                if ratioed_timesteps <= 0:
+                    print(
+                        f"[{self.name}][Seed {getattr(agent, 'seed', None)}]"
+                        f"[Timestep {self.timestep}/{total_timesteps}]"
+                        f"[Cycle {cycle+1}/{cycles}][{agent_type}]"
+                        f": Skipping learn() (0 timesteps)."
+                    )
+                    continue
+
+                print(
+                    f"[{self.name}][Seed {getattr(agent, 'seed', None)}]"
+                    f"[Timestep {self.timestep}/{total_timesteps}]"
+                    f"[Cycle {cycle+1}/{cycles}][{agent_type}]"
+                    f": Learning for {ratioed_timesteps}+ timesteps..."
+                )
+
+                if not isinstance(agent, BaseAlgorithm):
+                    raise NotImplementedError("Only SB3 BaseAlgorithm agents are supported here.")
+
+                # Avoid wrapping the same callback repeatedly
+                cb = callback
+                if cb is not None and not isinstance(cb, CallbackList):
+                    cb = CallbackList([cb])
+
+                agent.learn(
+                    ratioed_timesteps,
+                    callback=cb,
+                    log_interval=log_interval,
+                    tb_log_name=f"{tb_log_name}_{agent_type}",
+                    reset_num_timesteps=reset_num_timesteps,
+                    progress_bar=progress_bar,
+                )
+
+            # evaluate at end of cycle
+            if evaluation_interval is not None and eval_mdp is not None:
+                if (cycle + 1) % evaluation_interval == 0:
+                    evaluation_returns = self._evaluate(
+                        eval_mdp, evaluation_returns, cycle, eval_episodes, log_dir
+                    )
+
+        if len(evaluation_returns) == 0:
+            return 0.0
+        return float(np.mean([ret[1] for ret in evaluation_returns]))
+
+
+# --------------------------------------------------------------------------------------
+# View wrappers: expose only discrete OR only continuous actions while an internal policy
+# supplies the other part.
+# --------------------------------------------------------------------------------------
 
 class PamdpToMdpView(Env):
-    def __init__(self, parent:Env, action_space_is_discrete:bool, internal_policy=None, combine_continuous_actions:bool=False) -> None:
-        """Initialise an MDP to provide a method of only taking either discrete actions or action-parameters, whilst an internal policy handles the unchosen component.
-
-        Args:
-            parent (Env): PAMDP which this artificial MDP interacts with.
-            action_space_is_discrete (bool): Whether this MDP is intended for a discrete or continuous policy.
-            combine_continuous_actions (bool, optional): To improve compatability. Defaults to True.
-            internal_policy (_type_, optional): Specify policy to handle non-agent action component selection. Defaults to None (resulting in a random policy).
+    def __init__(
+        self,
+        parent: Env,
+        action_space_is_discrete: bool,
+        internal_policy: Optional[Callable[[Any], Any]] = None,
+        combine_continuous_actions: bool = False,
+    ) -> None:
+        """
+        Provide an MDP that only accepts either discrete actions or continuous parameters,
+        while an internal policy supplies the other component.
         """
         super().__init__()
-        self.combine_continuous_actions = combine_continuous_actions
+        self.parent = parent
+        self.combine_continuous_actions = bool(combine_continuous_actions)
+        self.action_space_is_discrete = bool(action_space_is_discrete)
+
+        # Expose only the original env observation (not the indicator)
         self.observation_space = parent.observation_space[1]
-        self.reward_range = parent.reward_range  # TODO: Amend in future
+        self.reward_range = parent.reward_range
         self.spec = parent.spec
         self.metadata = parent.metadata
         self.np_random = parent.np_random
-        self.parent = parent
-        if action_space_is_discrete:
+
+        if self.action_space_is_discrete:
             self.action_space = parent.discrete_action_space
         else:
             self.action_space = parent.action_parameter_space
             if self.combine_continuous_actions:
-                # ATTEMPT TO MAKE CONTINUOUS SPACE CONFORM TO SB3 PPO'S REQUIREMENTS
                 self.action_parameter_indices_mapping = self.parent.action_parameter_indices_mapping
-                self.action_space = self.parent.combine(self.action_space)  # Requires effort to restructure output later
+                self.action_space = self.parent.combine(self.action_space)
+
+        # Default internal policy is random over the *other* component
         if internal_policy is None:
-            if action_space_is_discrete:
-                self.internal_policy = lambda _: parent.action_parameter_space.sample()
+            if self.action_space_is_discrete:
+                self.internal_policy = lambda _obs: parent.action_parameter_space.sample()
             else:
-                self.internal_policy = lambda _: parent.discrete_action_space.sample()
+                self.internal_policy = lambda _obs: parent.discrete_action_space.sample()
         else:
             self.internal_policy = internal_policy
-        self.action_space_is_discrete = action_space_is_discrete
-        if action_space_is_discrete:
-            assert parent.expectingDiscreteAction()
-        else:
-            view_obs = self.parent.previous_step_output["obs"][1]
-            obs, reward, terminated, truncated, info = self.parent.step(self.internal_policy(view_obs))
-            assert not parent.expectingDiscreteAction()
 
     def step(self, action):
+        # Always return original obs (no indicator) to the learner
         if self.action_space_is_discrete:
+            # agent chooses discrete, internal chooses continuous
             obs, reward, terminated, truncated, info = self.parent.step(action)
             view_obs = obs[1]
             obs, reward, terminated, truncated, info = self.parent.step(self.internal_policy(view_obs))
             view_obs = obs[1]
-        else:
-            view_obs = self.parent.previous_step_output["obs"][1]
-            obs, reward, terminated, truncated, info = self.parent.step(self.internal_policy(view_obs))
-            view_obs = obs[1]
-            if self.combine_continuous_actions:
-                action = self.parent.uncombineAction(action)
-            obs, reward, terminated, truncated, info = self.parent.step(action)
-            view_obs = obs[1]
-        return view_obs, reward, terminated, truncated, info
+            return view_obs, reward, terminated, truncated, info
 
-    def reset(self, *, seed = None, options = None) -> tuple[ObsType, dict[str, Any]]:
+        # agent chooses continuous, internal chooses discrete
+        view_obs = self.parent.previous_step_output["obs"][1]
+        obs, _r0, term0, trunc0, _info0 = self.parent.step(self.internal_policy(view_obs))
+        # discrete half-step should not terminate, but be defensive:
+        if term0 or trunc0:
+            return obs[1], 0.0, term0, trunc0, _info0
+
+        if self.combine_continuous_actions:
+            action = self.parent.uncombineAction(action)
+
+        obs, reward, terminated, truncated, info = self.parent.step(action)
+        return obs[1], reward, terminated, truncated, info
+
+    def reset(self, *, seed=None, options=None) -> tuple[ObsType, dict[str, Any]]:
         obs, info = self.parent.reset(seed=seed, options=options)
-        view_obs = obs[0] if self.action_space_is_discrete else obs[1]
-        return view_obs, info
+        # Return the *original* env observation for both views
+        return obs[1], info
 
     def render(self):
         return self.parent.render()
@@ -195,86 +305,172 @@ class PamdpToMdpView(Env):
         return self.parent.close()
 
 
+# --------------------------------------------------------------------------------------
+# Core converter: turns PAMDP step (discrete + parameters) into a 2-step MDP.
+# --------------------------------------------------------------------------------------
+
 STEP_KEYS = ["obs", "reward", "terminated", "truncated", "info"]
+
+
 class PamdpToMdp(Wrapper):
+    """
+    Converts a parameterized action MDP (PAMDP) into a 2-step MDP:
+
+      Step A (discrete): choose action id (reward=0, no transition)
+      Step B (continuous): choose parameters (executes real env step)
+
+    Observation is a tuple: (indicator, original_obs)
+      - indicator == -1  => expecting discrete action
+      - indicator >= 0   => expecting continuous parameters for that action id
+    """
+
     def __init__(self, env: Env):
         super().__init__(env)
         self.discrete_action_space = self.action_space[0]
         self.action_parameter_space = self.action_space[1]
+
         self.action_parameter_indices_mapping = self._getParamIndices()
-        # self.action_space =
+
         original_observation_space = self.observation_space
-        self.observation_space = spaces.Tuple((
-            spaces.Discrete(2),  # Awaiting discrete-action or action-parameter indicator
-            original_observation_space
-        ))
-        self.previous_step_output = {key: None for key in STEP_KEYS[1:]}
-        self.previous_step_output[STEP_KEYS[0]] = [-1, None]  # Start with discrete action
+        self.observation_space = spaces.Tuple(
+            (
+                spaces.Discrete(2),  # (kept for legacy; indicator stored in obs[0] anyway)
+                original_observation_space,
+            )
+        )
+
+        # IMPORTANT: Initialise with non-terminal defaults (prevents "done" leaking across resets)
+        self.previous_step_output = {
+            "obs": (-1, None),
+            "reward": 0.0,
+            "terminated": False,
+            "truncated": False,
+            "info": {},
+        }
         self.discrete_action_choice = None
 
-    def getComponentMdp(self, action_space_is_discrete: bool, internal_policy=None, combine_continuous_actions:bool=False) -> Env:
-        return PamdpToMdpView(self, action_space_is_discrete, internal_policy, combine_continuous_actions=combine_continuous_actions)
+    def getComponentMdp(
+        self,
+        action_space_is_discrete: bool,
+        internal_policy=None,
+        combine_continuous_actions: bool = False,
+    ) -> Env:
+        return PamdpToMdpView(
+            self,
+            action_space_is_discrete=action_space_is_discrete,
+            internal_policy=internal_policy,
+            combine_continuous_actions=combine_continuous_actions,
+        )
 
-    def expectingDiscreteAction(self):
+    def expectingDiscreteAction(self) -> bool:
         assert -1 not in self.discrete_action_space
-        return self.previous_step_output["obs"][0] == -1  # Since discrete actions are indicated >=0
+        return self.previous_step_output["obs"][0] == -1
 
-    def reset(self, *, seed = None, options = None) -> tuple[ObsType, dict[str, Any]]:
+    def reset(self, *, seed=None, options=None) -> tuple[ObsType, dict[str, Any]]:
         obs, info = super().reset(seed=seed, options=options)
-        converted_obs = (-1, obs)  # Indicator, obs
-        self.previous_step_output["obs"] = converted_obs
+        converted_obs = (-1, obs)
+
+        # FULL reset of cached step output (critical)
+        self.discrete_action_choice = None
+        self.previous_step_output = {
+            "obs": converted_obs,
+            "reward": 0.0,
+            "terminated": False,
+            "truncated": False,
+            "info": {},
+        }
         return converted_obs, info
 
     def step(self, partial_action):
+        # --- Step A: discrete choice (no env transition, reward=0, never terminal) ---
         if self.expectingDiscreteAction():
             assert partial_action in self.discrete_action_space
-            self.discrete_action_choice = partial_action
-            obs = (partial_action, self.previous_step_output["obs"][1])
-            reward = 0
-            terminated, truncated, info = (self.previous_step_output[key] for key in STEP_KEYS[2:])
-            info = {}  # Resolves issue with RecordEpisodeStatistics wrapper
-        else:
-            if partial_action not in self.action_parameter_space:
-                # Make it a tuple of arrays, assuming that's what the env wants
-                indices = self.action_parameter_indices_mapping
-                partial_action = tuple(np.array(partial_action[indices[action]]) for action in range(len(self.action_parameter_space)))
-            assert partial_action in self.action_parameter_space
-            # if partial_action not in self.action_parameter_space:
-                # Assume combined and uncombine
-                # partial_action = self.uncombine(self.action_parameter_space, partial_action)
-            action = (np.int64(self.discrete_action_choice), partial_action)
-            obs, reward, terminated, truncated, info = self.env.step(action)
-            obs = (-1, obs)
+            self.discrete_action_choice = int(partial_action)
+
+            obs = (self.discrete_action_choice, self.previous_step_output["obs"][1])
+            reward = 0.0
+            terminated, truncated = False, False
+            info = {}
+
+            step_output = (obs, reward, terminated, truncated, info)
+            self.previous_step_output = dict(zip(STEP_KEYS, step_output))
+            return step_output
+
+        # --- Step B: continuous parameters (executes the real env step) ---
+        # Convert combined continuous vector -> tuple-of-arrays if needed
+        params = partial_action
+
+        if not self.action_parameter_space.contains(params):
+            # Likely received a combined vector (e.g. PPO on a single Box)
+            indices = self.action_parameter_indices_mapping
+            # Build tuple-of-arrays (one per discrete action), clip/cast to each Box bounds
+            out = []
+            for a in range(len(self.action_parameter_space)):
+                box = self.action_parameter_space[a]
+                arr = np.asarray(partial_action[indices[a]], dtype=box.dtype)
+                arr = np.clip(arr, box.low, box.high)
+                out.append(arr)
+            params = tuple(out)
+
+        # Be tolerant to dtype/bounds noise
+        if isinstance(params, tuple):
+            fixed = []
+            for a in range(len(self.action_parameter_space)):
+                box = self.action_parameter_space[a]
+                arr = np.asarray(params[a], dtype=box.dtype)
+                arr = np.clip(arr, box.low, box.high)
+                fixed.append(arr)
+            params = tuple(fixed)
+
+        action = (np.int64(self.discrete_action_choice), params)
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # After real step, go back to expecting discrete next
+        converted_obs = (-1, obs)
+
+        # reset discrete choice (optional, but safer)
+        self.discrete_action_choice = None
+
         if info is None:
             info = {}
-        step_output = obs, reward, terminated, truncated, info
-        self.previous_step_output = {key: val for (key, val) in list(zip(STEP_KEYS, step_output))}
+
+        step_output = (converted_obs, reward, terminated, truncated, info)
+        self.previous_step_output = dict(zip(STEP_KEYS, step_output))
         return step_output
 
     def uncombineAction(self, action):
-        # Return expected Tuple of boxes by partioning the box accordingly
-        output = [np.empty(shape=box.shape) for box in self.action_parameter_space.spaces]
-        for i in range(len(self.action_parameter_space)):
-            output[i] = np.array(action[self.action_parameter_indices_mapping[i]])
-        assert tuple(output) in self.action_parameter_space
+        """Partition a combined action vector into the Tuple(Box, Box, ...) expected by the PAMDP."""
+        output = []
+        for i, box in enumerate(self.action_parameter_space.spaces):
+            arr = np.asarray(action[self.action_parameter_indices_mapping[i]], dtype=box.dtype)
+            arr = np.clip(arr, box.low, box.high)
+            output.append(arr)
         return tuple(output)
 
     def combine(self, space):
-        # Receives a tuple of boxes
-        # Outputs a single box
-        # Samples of output box can be interpreted in terms of original tuple
-        return spaces.Box(low=np.array(self.param_lows), high=np.array(self.param_highs), dtype=np.float32)
+        """Combine Tuple(Box, Box, ...) into a single Box for SB3 compatibility."""
+        return spaces.Box(
+            low=np.array(self.param_lows, dtype=np.float32),
+            high=np.array(self.param_highs, dtype=np.float32),
+            dtype=np.float32,
+        )
 
     def _getParamIndices(self):
-        indices = {a: [] for a in list(range(self.discrete_action_space.n))}
+        """
+        Build mapping from each action's parameter Box indices into a single concatenated vector.
+        """
+        indices = {a: [] for a in range(self.discrete_action_space.n)}
         space = self.action_parameter_space
+
         self.param_lows = []
         self.param_highs = []
+
         for action in range(len(space)):
             box = space[action]
-            for j in range(box.shape[0]):
-                indices[action].append(len(self.param_highs))  # partition box based on original Tuple
-                self.param_highs.append(box.high[j])
-                self.param_lows.append(box.low[j])
-            indices[action] = np.array(indices[action])
+            for j in range(int(box.shape[0])):
+                indices[action].append(len(self.param_highs))
+                self.param_highs.append(float(box.high[j]))
+                self.param_lows.append(float(box.low[j]))
+            indices[action] = np.array(indices[action], dtype=np.int64)
+
         return indices

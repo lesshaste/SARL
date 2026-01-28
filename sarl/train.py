@@ -128,7 +128,22 @@ def main(job_config: DictConfig):
     #     print(alg_params)
     #     return -((alg_params["discrete_learning_rate"] - 0.5) ** 2)
     # return toy_func_to_optimise()
-    return chosen_script(**job_config["parameters"], output_dir=output_dir)
+    import inspect
+
+    params = dict(job_config["parameters"])
+    sig = inspect.signature(chosen_script)
+
+    # If the function doesn't accept **kwargs, only pass what it declares
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    if not accepts_kwargs:
+        params = {k: v for k, v in params.items() if k in sig.parameters}
+
+    return chosen_script(**params, output_dir=output_dir)
+
+    # return chosen_script(**job_config["parameters"], output_dir=output_dir)
 
 
 if __name__ == "__main__":
