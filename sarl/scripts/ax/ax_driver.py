@@ -33,29 +33,32 @@ LOCAL_DEBUG_MODE = True  # set False on slurm
 SUBMITIT_DIR = "submitit"
 HYDRA_CONFIG_PATH = "../../config"
 
+
+
 CPU_CORES_PER_TASK = 4
 
 # --- experiment size / runtime ---
-MAX_TRIALS = 80
-PARALLEL_LIMIT = 2
+MAX_TRIALS = 100
+PARALLEL_LIMIT = 1
 
 # --- training settings ---
 TRAIN_EPISODES = 1_000_000  # (note: you commented "does nothing currently")
-CYCLES = 10
-LEARNING_STEPS = 10000 * CYCLES
+CYCLES = 3
+LEARNING_STEPS = 100000 
 
 # --- on-policy ---
 ON_POLICY_PARAMS = {"n_steps": 100}
 
 # --- search bounds ---
-BOUNDS_LR = (1e-6, 1e-3)
-BOUNDS_UPDATE_RATIO = (0.01, 0.99)
+BOUNDS_LR_DISCRETE = (1e-2, 1.3e-2)     # <-- set your discrete LR bounds here
+BOUNDS_LR_CONTINUOUS = (4e-4, 4.3e-4)   # <-- set your continuous LR bounds here
+BOUNDS_UPDATE_RATIO = (0.048, 0.049)
 
 # --- misc ---
 SEEDS = [42]
 ENVS = ["platform"]
 
-DISCRETE_ALGS = ["a2c"]
+DISCRETE_ALGS = ["ppo"]
 CONTINUOUS_ALGS = ["ppo"]
 
 cluster = "debug" if LOCAL_DEBUG_MODE else "slurm"
@@ -166,10 +169,17 @@ update_ratio_param = RangeParameterConfig(
 
 
 def get_params_by_alg(label: str = ""):
+    if label == "discrete":
+        lr_bounds = BOUNDS_LR_DISCRETE
+    elif label == "continuous":
+        lr_bounds = BOUNDS_LR_CONTINUOUS
+    else:
+        raise ValueError(f"Unknown label: {label}")
+
     shared_params = [
         RangeParameterConfig(
             name=f"{label}_learning_rate",
-            bounds=(BOUNDS_LR[0], BOUNDS_LR[1]),
+            bounds=lr_bounds,
             parameter_type="float",
             scaling="log",
         )
@@ -263,7 +273,7 @@ def optimise():
                     output_dir = None
 
                 if output_dir is not None:
-                    csv_reward = _read_eval_csv_mean_reward(output_dir / "eval.csv", mode="max")
+                    csv_reward = _read_eval_csv_mean_reward(output_dir / "eval.csv", mode="last")
                     if csv_reward is not None:
                         mean_reward = csv_reward
                         print(f"[AX][METRIC] Using mean_reward from eval.csv: {mean_reward:.6f} (output_dir={output_dir})")
@@ -297,17 +307,32 @@ def optimise():
                         client.complete_trial(trial_index=trial_index, raw_data=result)
                         results.append(result)
                         jobs.remove((job, trial_index))
-
+                        # Observed best
                         try:
-                            best_params, best_metrics, best_trial_index, _ = client.get_best_parameterization()
-                            print(f"\n>>> BEST SO FAR (Trial {best_trial_index}) <<<")
-                            print(f"Best Mean Reward: {best_metrics}")
-                            print(f"Best Parameters:  {best_params}")
-                            print("-" * width)
-                        except Exception as e:
-                            print(f"[INFO] Could not determine best parameters yet: {e}")
+                            obs = client.get_best_parameterization(use_model_predictions=False)
+                        except TypeError:
+                            obs = None
 
-            best = client.get_best_parameterization()
+                        # Model-predicted best
+                        pred = client.get_best_parameterization()
+
+                        print("\n>>> BEST OBSERVED <<<")
+                        if obs is not None:
+                            print(f"Trial:  {obs[2]}")
+                            print(f"Metric: {obs[1]}")
+                            print(f"Params: {obs[0]}")
+                        else:
+                            print("(Ax version doesn't support use_model_predictions=False)")
+
+                        print("\n>>> BEST PREDICTED (MODEL) <<<")
+                        print(f"Trial:  {pred[2]}")
+                        print(f"Metric: {pred[1]}")
+                        print(f"Params: {pred[0]}")
+
+
+            pred_best = client.get_best_parameterization(use_model_predictions=True)
+            print(f"Predicted best according to model: {pred_best}")
+            best = client.get_best_parameterization(use_model_predictions=False)
             return {"best": best, "results": results}
 
         outcome = run_parallel_exps()

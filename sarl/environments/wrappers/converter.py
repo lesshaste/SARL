@@ -108,11 +108,17 @@ class HybridPolicy:
         evaluation_returns.append(mean_return)
 
         if log_dir is not None:
-            file_name = f"{log_dir}/eval.csv"
+            # Make sure the output directory exists before writing.
+            from pathlib import Path
+
+            log_path = Path(log_dir)
+            file_path = log_path if log_path.suffix else (log_path / "eval.csv")
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
             print(f"[REWARD]: Mean reward = {mean_return[1]}")
-            print(f"[OUTPUT]: Writing to {file_name}")
+            print(f"[OUTPUT]: Writing to {file_path}")
             np.savetxt(
-                fname=file_name,
+                fname=str(file_path),
                 X=np.array(evaluation_returns, dtype=np.float64),
                 header='"training_timesteps","mean_eval_episode_return"',
                 delimiter=",",
@@ -138,6 +144,8 @@ class HybridPolicy:
         log_dir: Optional[str] = None,
         rollout_length: Optional[int] = None,
         update_ratio: float = 0.5,
+        objective_aggregation: str = "last",  # 'last' | 'max' | 'mean_last_k'
+        objective_last_k: int = 3,
     ):
         """
         Alternate training between discrete and continuous agents.
@@ -248,7 +256,26 @@ class HybridPolicy:
 
         if len(evaluation_returns) == 0:
             return 0.0
-        return float(np.mean([ret[1] for ret in evaluation_returns]))
+
+        rewards = [ret[1] for ret in evaluation_returns]
+        if objective_aggregation == "last":
+            objective = rewards[-1]
+        elif objective_aggregation == "max":
+            objective = max(rewards)
+        elif objective_aggregation in ("mean_last_k", "last_k_mean"):
+            k = max(1, min(int(objective_last_k), len(rewards)))
+            objective = float(np.mean(rewards[-k:]))
+        else:
+            raise ValueError(
+                f"Unknown objective_aggregation={objective_aggregation!r}. "
+                "Use 'last', 'max', or 'mean_last_k'."
+            )
+
+        print(
+            f"[REWARD][OBJECTIVE]: aggregation={objective_aggregation} value={objective} "
+            f"(evaluations={len(rewards)})"
+        )
+        return float(objective)
 
 # --------------------------------------------------------------------------------------
 # View wrappers: expose only discrete OR only continuous actions while an internal policy

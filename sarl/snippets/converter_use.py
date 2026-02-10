@@ -218,6 +218,7 @@ def _alg_kwargs_for(role: str, alg_params: Dict[str, Any], seed: int, tensorboar
 def _make_agent(alg_name: str, env: gym.Env, role: str, alg_params: Dict[str, Any], seed: int, tensorboard_log: Optional[str]) -> BaseAlgorithm:
     cls = ALG_CLS[alg_name]
     kwargs = _alg_kwargs_for(role=role, alg_params=alg_params, seed=seed, tensorboard_log=tensorboard_log)
+    print(f"[{alg_name}][{role}] SB3 kwargs = {kwargs}")
     return cls("MlpPolicy", env, **kwargs)
 
 
