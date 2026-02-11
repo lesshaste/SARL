@@ -326,11 +326,11 @@ def runConverter(
 
         # Wire internal policies so each view can complete a full env step
         def _continuous_policy(obs):
-            a, _ = continuous_agent.predict(obs, deterministic=False)
+            a, _ = continuous_agent.predict(obs, deterministic=True)
             return a
 
         def _discrete_policy(obs):
-            a, _ = discrete_agent.predict(obs, deterministic=False)
+            a, _ = discrete_agent.predict(obs, deterministic=True)
             return int(np.asarray(a).squeeze())
 
         discrete_view.internal_policy = _continuous_policy
@@ -396,7 +396,7 @@ def _make_entrypoint(disc_key: str, cont_key: str, env_key: str):
         learning_steps: int = 20000,
         cycles: int = 4,
         seeds: Sequence[int] = (1,),
-        eval_episodes: int = 30,
+        eval_episodes: int = 120,
         alg_params: Optional[Dict[str, Any]] = None,
         output_dir: str = ".",
         **_,

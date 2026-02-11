@@ -56,45 +56,39 @@ class HybridPolicy:
         else:
             raise ValueError("Provide either continuousPolicy or continuousAgent")
 
-    def _call_policy(self, policy: Callable, obs_inner):
-        """
-        Handles SB3 predict() and plain callables uniformly.
-        SB3 predict returns (action, state). Custom callables return action.
-        """
+    # in HybridPolicy (converter.py)
+
+    def _call_policy(self, policy, obs_inner, *, deterministic: bool = False):
+        # Prefer calling with deterministic kwarg (SB3), fallback to plain callable
         try:
-            out = policy(obs_inner)
+            out = policy(obs_inner, deterministic=deterministic)
         except TypeError:
-            # If someone passes SB3 policy expecting (obs, state, episode_start, deterministic)
-            out = policy(obs_inner, deterministic=False)
+            out = policy(obs_inner)
         if isinstance(out, tuple):
             return out[0]
         return out
 
-    def predict(self, obs):
-        # obs is (indicator, original_obs)
+    def predict(self, obs, *, deterministic: bool = False):
         if obs[0] == -1:
-            action = self._call_policy(self.discretePolicy, obs[1])
-            # SB3 often returns np.array([...]) for discrete
+            action = self._call_policy(self.discretePolicy, obs[1], deterministic=deterministic)
             if isinstance(action, (np.ndarray, list)):
                 action = int(np.asarray(action).squeeze())
             else:
                 action = int(action)
             return action
-
-        # continuous parameters
-        assert obs[0] > -1
-        action = self._call_policy(self.continuousPolicy, obs[1])
+        action = self._call_policy(self.continuousPolicy, obs[1], deterministic=deterministic)
         return action
+
 
     def _evaluate(self, eval_mdp, evaluation_returns, cycle, eval_episodes, log_dir):
         returns = []
         base_seed = 0 if self.seed is None else int(self.seed)
         for i in range(eval_episodes):
-            obs, info = eval_mdp.reset(seed=base_seed + cycle + i)
+            obs, info = eval_mdp.reset(seed=base_seed + 10**7 + i)
             done = False
             last_info = info
             while not done:
-                action = self.predict(obs)
+                action = self.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, last_info = eval_mdp.step(action)
                 done = bool(terminated or truncated)
             # RecordEpisodeStatistics puts episode return in info["episode"]["r"] on terminal step
@@ -140,7 +134,7 @@ class HybridPolicy:
         tb_log_name: str = "run",
         reset_num_timesteps: bool = False,
         progress_bar: bool = False,
-        eval_episodes: int = 15,
+        eval_episodes: int = 120,
         log_dir: Optional[str] = None,
         rollout_length: Optional[int] = None,
         update_ratio: float = 0.5,

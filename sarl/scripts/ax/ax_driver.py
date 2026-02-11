@@ -44,15 +44,15 @@ PARALLEL_LIMIT = 1
 # --- training settings ---
 TRAIN_EPISODES = 1_000_000  # (note: you commented "does nothing currently")
 CYCLES = 3
-LEARNING_STEPS = 100000 
+LEARNING_STEPS = 40000 
 
 # --- on-policy ---
 ON_POLICY_PARAMS = {"n_steps": 100}
 
 # --- search bounds ---
-BOUNDS_LR_DISCRETE = (1e-2, 1.3e-2)     # <-- set your discrete LR bounds here
-BOUNDS_LR_CONTINUOUS = (4e-4, 4.3e-4)   # <-- set your continuous LR bounds here
-BOUNDS_UPDATE_RATIO = (0.048, 0.049)
+BOUNDS_LR_DISCRETE = (1e-5, 1e-2)     # <-- set your discrete LR bounds here
+BOUNDS_LR_CONTINUOUS = (1e-5, 1e-2)   # <-- set your continuous LR bounds here
+BOUNDS_UPDATE_RATIO = (0.01, 0.99)
 
 # --- misc ---
 SEEDS = [42]

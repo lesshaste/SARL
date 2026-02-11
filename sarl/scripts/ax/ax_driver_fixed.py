@@ -32,7 +32,7 @@ CPU_CORES_PER_TASK = 4
 
 # --- training settings ---
 TRAIN_EPISODES = 1_000_000
-CYCLES = 4
+CYCLES = 6
 LEARNING_STEPS = 40000
 
 # --- on-policy ---
@@ -49,7 +49,7 @@ CONTINUOUS_ALGS = ["ppo"]
 FIXED_PARAMS = {
     "discrete_learning_rate": 1.0e-2,
     "continuous_learning_rate": 4.0e-4,
-    "update_ratio": 0.05,
+    "update_ratio": 0.2,
 }
 
 cluster = "debug" if LOCAL_DEBUG_MODE else "slurm"
